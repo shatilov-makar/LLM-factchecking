@@ -7,8 +7,6 @@ from serpapi import GoogleSearch
 from llamaapi import LlamaAPI
 import subprocess
 nltk.download('punkt')
-##nltk.download('wordnet')
-##nltk.download('omw-1.4')
 
 
 class Factchecker:
