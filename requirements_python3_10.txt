@@ -1,0 +1,6 @@
+transformers
+sentence-transformers
+serpapi
+google-search-results
+llamaapi
+nltk

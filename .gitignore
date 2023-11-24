@@ -1,0 +1,6 @@
+__pycache__
+data
+test*
+python3_7/*
+python3_10/*
+coref_resolution.txt
