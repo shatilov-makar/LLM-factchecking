@@ -1,4 +1,4 @@
-#!python3_7\Scripts\python.exe
+#!factchecking_v1/python3_7/bin/python
 import spacy
 import neuralcoref
 import sys
@@ -32,7 +32,7 @@ def coref_resolution(text):
 
 
 @app.post('/coref_resolution')
-async def sum_two_digits(data: TextInput) -> dict:
+async def solve_coref_resolution(data: TextInput) -> dict:
     try:
         text = data.input
         result = coref_resolution(text)
