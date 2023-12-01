@@ -3,4 +3,8 @@ sentence-transformers
 serpapi
 google-search-results
 llamaapi
+allennlp
+allennlp-models
 nltk
+Wikipedia-API
+spacy==3.6.0

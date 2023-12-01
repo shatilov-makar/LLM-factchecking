@@ -1,159 +1,238 @@
-#!factchecking_v1/python3_10/bin/python
+#!python3_10/bin/python
 import json
 import nltk
 from nltk.tokenize import sent_tokenize
 from sentence_transformers import SentenceTransformer, util
-from serpapi import GoogleSearch
-from llamaapi import LlamaAPI
-import subprocess
-nltk.download('punkt')
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+# from llamaapi import LlamaAPI
+from SemanticAnalys import SemanticAnalys
+import wikipediaapi
+import requests
+import torch
+from torch import nn
+
+CONTRADICTION = 'CONTRADICTION'
+NEUTRAL = 'NEUTRAL'
+ENTAILMENT = 'ENTAILMENT'
+SUSPICIOUS = 'SUSPICIOUS'
 
 
 class Factchecker:
-    def __init__(self, LLAMA_API_TOKEN, SERP_API_TOKEN) -> None:
-        self.LLAMA_API_TOKEN = LLAMA_API_TOKEN
-        self.SERP_API_TOKEN = SERP_API_TOKEN
-        self.bert = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+    def __init__(self) -> None:
 
-    def __get_llm_output(self, prompt: str) -> str:
-        '''
-            Returns LLAMA-2 output for the given prompt.
-        '''
-        llama = LlamaAPI(self.LLAMA_API_TOKEN)
-        api_request_json = {
-            "temperature": 0.1,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-        }
-        response = llama.run(api_request_json)
-        return json.dumps(response.json()['choices'][0]['message']['content'], indent=2)
+        self.bert = SentenceTransformer(
+            'sentence-transformers/all-mpnet-base-v2')
+        self.tokenizer = AutoTokenizer.from_pretrained("roberta-large-mnli")
+
+        self.roberta = AutoModelForSequenceClassification.from_pretrained(
+            "roberta-large-mnli")
+
+        self.semantic_analys = SemanticAnalys()
+        self.punct = set(['.', '!', '?', '/n'])
+
+    # def __get_llm_output(self, prompt: str) -> str:
+    #     '''
+    #         Returns LLAMA-2 output for the given prompt.
+    #     '''
+    #     llama = LlamaAPI(self.LLAMA_API_TOKEN)
+    #     api_request_json = {
+    #         "temperature": 0.1,
+    #         "messages": [
+    #             {"role": "user", "content": prompt},
+    #         ],
+    #         "stream": False,
+    #     }
+    #     response = llama.run(api_request_json)
+    #     return json.dumps(response.json()['choices'][0]['message']['content'], indent=2)
 
     def __coref_resolution(self, text: str) -> str:
         '''
             Solves a problem coreference resolution for a given text.
         '''
-        subprocess.run(['python3_7/bin/python', 'coref_resolution.py', text])
-        with open('coref_resolution.txt') as f:
-            lines = f.readlines()
-        return ' '.join([line.strip() for line in lines])
+        headers = {
+            'Content-Type': 'application/json',
+        }
 
-    def __tokenize_sentences(self, text: str) -> list:
+        json_data = {
+            'input': text,
+            'parameters': {
+                'data1': None,
+                'data2': None
+            }
+        }
+        response = requests.post(
+            'http://127.0.0.1:8001/coref_resolution', headers=headers, json=json_data)
+        ans = json.loads(response.text)
+        return ans['coref_resolution'].strip()
+
+    def __tokenize_sentences(self, text: list) -> list:
         '''
             Performs text preprocessing and sentence-piece tokenization 
         '''
         text = self.__coref_resolution(text)
+        print(text)
         with open('intros.txt') as f:
             intros = set([line.rstrip() for line in f])
-        punct = set(['.', '!', '?', '/n'])
 
-        for intro in intros:# Remove 'However', 'Besides', 'Hence' and other intro-expressions.
+        # Remove 'However', 'Besides', 'Hence' and other intro-expressions.
+        for intro in intros:
             if intro in text:
                 text = text.replace(intro, '')
         sentences = []
-        if text[-1] in punct:# Remove incomplited sentences
+        if text[-1] in self.punct:  # Remove incomplited sentences
             sentences = [t.strip() for t in sent_tokenize(text)]
         else:
             sentences = [t.strip() for t in sent_tokenize(text)[:-1]]
-        return sentences
+        sa = self.semantic_analys.semantic_analys(sentences)
+        return sa
 
-    def __run_google_search(self, query: str) -> list:
-        '''
-            Returns the Google SERP response to a query.
-        '''
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": self.SERP_API_TOKEN,
-            'num': 20
-        }
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        return results["organic_results"]
+    def __run_wiki_search(self, topic) -> list:
+        print(topic)
+        wiki_wiki = wikipediaapi.Wikipedia(
+            'Factcheckung_LLM (m.point2011@yandex.ru)', 'en')
+        page = wiki_wiki.page(topic)
+        refs = []
 
-    def __get_sentence_similarity(self, sentence_1: str, sentence_2: str) -> float:
-        '''
-            Returns the semantic similarity of two sentences, calculated using 
-            the cosine distance between sentence embeddings.
-        '''
-        embedding_source = self.bert.encode(sentence_1, convert_to_tensor=True)
-        embedding_ref = self.bert.encode(sentence_2, convert_to_tensor=True)
-        score = float(util.pytorch_cos_sim(embedding_source, embedding_ref)[0][0])
-        return score
+        if page.exists():
+            wiki_sentences = []
+            # text = self.__coref_resolution(page.text)
+            for p in page.text.split('\n'):
+                if p != '':
+                    if p[-1] not in self.punct:
+                        p += '.'
+                    wiki_sentences += sent_tokenize(p)
+            refs = [{
+                "sentence": sentence,
+                "embedding": None
+            } for sentence in wiki_sentences]
+        return refs
 
-    def __get_relevant_refs(self, refs: list, source: list):
-        '''
-            Filter Google's response, saves only relevant references.
-        '''
-        all_sentences = []
-        for ref in refs:
-            init_sentence = ref['snippet']
-            sentences = sent_tokenize(init_sentence)
-            all_sentences += sentences
+    def __get_entailment_score(self, text, hypothesis):
+        if hypothesis[-1] in self.punct:
+            sequence_to_classify = ' '.join([hypothesis, text])
+        else:
+            sequence_to_classify = '. '.join([hypothesis, text])
+
+        inputs = self.tokenizer(sequence_to_classify,
+                                return_tensors="pt")
+        softmax = nn.Softmax(dim=1)
+        with torch.no_grad():
+            logits = self.roberta(**inputs).logits
+            res = {}
+            for label, score in zip(self.roberta.config.id2label.values(), softmax(logits).numpy()[0]):
+                res[label] = score
+            return res
+
+    def __get_judgment(self, segment, ref):
+        score = self.__get_entailment_score(segment, ref)
+        judgment = max(score, key=score.get)
+        if judgment in [ENTAILMENT, CONTRADICTION]:
+            return judgment
+        if score[ENTAILMENT] > score[CONTRADICTION] and score[ENTAILMENT] > 0.10:
+            return ENTAILMENT
+        return NEUTRAL
+
+    def __get_relevant_refs(self, refs: list, source: str, threshold: float = 0.7):
+        source_embedding = self.bert.encode(
+            source, convert_to_tensor=True)
         scores = []
-        for ref in all_sentences:
-            score = self.__get_sentence_similarity(source, ref)
+        for sentence in refs:
+            if sentence['embedding'] is None:
+                sentence['embedding'] = self.bert.encode(
+                    sentence['sentence'], convert_to_tensor=True)
+
+            score = float(util.pytorch_cos_sim(
+                source_embedding, sentence['embedding'])[0][0])
             scores.append({
-                'ref': ref,
+                'ref': sentence['sentence'],
+                'embedding': sentence['embedding'],
                 'score': score
             })
-
-        candidates = sorted(list(filter(lambda r: r['score'] > 0.725, scores)),
-                            key=lambda x: x['score'], reverse=True)
-        if len(candidates) > 1:
-            for i, c in enumerate(candidates):
-                current_refs = candidates[i+1:]
-                for ref in current_refs:
-                    score = self.__get_sentence_similarity(c['ref'], ref['ref'])
-                    if score > 0.45:
-                        candidates.remove(ref)
-        elif len(candidates) == 0:
-            return None
+            if score > 0.85:
+                return [scores[-1]]
+        candidates = sorted(list(filter(lambda r: r['score'] > threshold, scores)),
+                            key=lambda x: x['score'], reverse=True)[:5]
         return candidates
-    
-    def start_factchecking(self, output):
+
+    def start_factchecking(self, output, threshold):
         '''
             Performs factchecking for a given LLM output
         '''
-        llm_output_tokenized = self.__tokenize_sentences(output)
-        reliable_sentences = []
+        llm_output_tokenized, topic = self.__tokenize_sentences(output)
+        refs = self.__run_wiki_search(topic)
+        fact_checking_results = []
         for sentence in llm_output_tokenized:
-            google_outputs = self.__run_google_search(sentence)
-            relevant_google_outputs = self.__get_relevant_refs(google_outputs, sentence)
-            if relevant_google_outputs is None:
-                continue
-            prompt = f'''Source: "{sentence}" '''
-            for i, fact in enumerate(relevant_google_outputs):
-                prompt += f'Fact_{i+1}: "{fact}\n"'
-            facts_name = "Fact_1"
-            if len(relevant_google_outputs) > 1:
-                for i, fact in enumerate(relevant_google_outputs[1:]):
-                    facts_name += f'and Fact_{i + 2}'
-            prompt += f'New_Source = Source modified to reflect {facts_name}.\
-                            If the Source approximately reflects the {facts_name},\
-                            New_Source matches exactly Source.\
-                            Do not type explanation, comments and score.\
-                            Start type with: "New_Source: ...'
+            wait_list = []
+            sentence_fc = []
+            for segment in sentence['segmented_sentences']:
+                relevant_refs = self.__get_relevant_refs(
+                    refs, segment, threshold)
+                relevant_refs_count = len(relevant_refs)
+                if relevant_refs_count > 0:  # Есть референсы?
+                    if relevant_refs_count > 1:  # Есть несколько референсов?
+                        refs_judgment = [self.__get_judgment(
+                            segment, ref['ref']) for ref in relevant_refs]
+                        if any([s == ENTAILMENT for s in refs_judgment]) and \
+                                all([s != CONTRADICTION for s in refs_judgment]):
+                            sentence_fc.append({
+                                'sentence_id': sentence['sentence_id'],
+                                "segment": segment,
+                                "judgment": ENTAILMENT,
+                                "refs_judgment": refs_judgment,
+                                'relevant_refs': [r['ref'] for r in relevant_refs]
+                            })
+                        elif any([s == CONTRADICTION for s in refs_judgment]):
+                            sentence_fc.append({
+                                'sentence_id': sentence['sentence_id'],
+                                "segment": segment,
+                                "judgment": CONTRADICTION,
+                                "refs_judgment": refs_judgment,
+                                'relevant_refs': [r['ref'] for r in relevant_refs]
 
-            llm_output = self.__get_llm_output(prompt)
-            llm_output = llm_output.strip('\n. "').split('New_Source:')[-1].strip()
-            if '"' in llm_output:
-                llm_output = llm_output.split('"')[1]
-            score = self.__get_sentence_similarity(sentence, llm_output)
-            if score < 0.60:
-                continue
-            elif score < 0.90:
-                reliable_sentences.append(llm_output)
-            else:
-                reliable_sentences.append(sentence)
-        if len(reliable_sentences) == 0:
-            return "The generated text was completely incorrect and cannot be corrected!"
-        reliable_sentences = ",".join(['"' + sentence + '"' for sentence in reliable_sentences])
-        prompt = f'Write a text using following sentences: {reliable_sentences}\n\
-                    Do not use any additional information.  \
-                    Do not type explanation and comments. \
-                    Start with "Text: ..."'
-        llm_output = self.__get_llm_output(prompt)
-        return llm_output.split('Text:')[-1].strip()
-    
+                            })
+                        else:
+                            sentence_fc.append({
+                                'sentence_id': sentence['sentence_id'],
+                                "segment": segment,
+                                "judgment": NEUTRAL,
+                                "refs_judgment": refs_judgment,
+                                'relevant_refs': [r['ref'] for r in relevant_refs]
+                            })
+
+                    else:
+                        judgment = self.__get_judgment(
+                            segment, relevant_refs[0]['ref'])
+                        sentence_fc.append({
+                            'sentence_id': sentence['sentence_id'],
+                            "segment": segment,
+                            "judgment": judgment,
+                            'relevant_refs': [r['ref'] for r in relevant_refs]
+                        })
+
+                # Предложение разбито на несколько?
+                elif len(sentence['segmented_sentences']) > 1:
+                    wait_list.append(segment)
+                else:
+                    sentence_fc.append({
+                        'sentence_id': sentence['sentence_id'],
+                        "segment": segment,
+                        "judgment": SUSPICIOUS
+                    })
+
+            for segment in wait_list:
+                if any([s["judgment"] == ENTAILMENT for s in sentence_fc]) and \
+                        all([s["judgment"] != CONTRADICTION for s in sentence_fc]):
+
+                    sentence_fc.append({
+                        'sentence_id': sentence['sentence_id'],
+                        "segment": segment,
+                        "judgment": NEUTRAL
+                    })
+                else:
+                    sentence_fc.append({
+                        'sentence_id': sentence['sentence_id'],
+                        "segment": segment,
+                        "judgment": SUSPICIOUS
+                    })
+            fact_checking_results += sentence_fc.copy()
+        return fact_checking_results
