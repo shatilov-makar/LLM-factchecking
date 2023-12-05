@@ -6,10 +6,11 @@ from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 # from llamaapi import LlamaAPI
 from SemanticAnalys import SemanticAnalys
-import wikipediaapi
+import wikipedia
 import requests
 import torch
 from torch import nn
+import spacy
 
 CONTRADICTION = 'CONTRADICTION'
 NEUTRAL = 'NEUTRAL'
@@ -29,6 +30,10 @@ class Factchecker:
 
         self.semantic_analys = SemanticAnalys()
         self.punct = set(['.', '!', '?', '/n'])
+        self.nlp = spacy.load('en_core_web_sm')
+
+    def __del__(self):
+        torch.cuda.empty_cache()
 
     # def __get_llm_output(self, prompt: str) -> str:
     #     '''
@@ -62,8 +67,10 @@ class Factchecker:
         }
         response = requests.post(
             'http://127.0.0.1:8001/coref_resolution', headers=headers, json=json_data)
-        ans = json.loads(response.text)
-        return ans['coref_resolution'].strip()
+        if response.status_code == 200:
+            ans = json.loads(response.text)
+            return ans['coref_resolution'].strip()
+        return text
 
     def __tokenize_sentences(self, text: list) -> list:
         '''
@@ -88,24 +95,20 @@ class Factchecker:
 
     def __run_wiki_search(self, topic) -> list:
         print(topic)
-        wiki_wiki = wikipediaapi.Wikipedia(
-            'Factcheckung_LLM (m.point2011@yandex.ru)', 'en')
-        page = wiki_wiki.page(topic)
-        refs = []
-
-        if page.exists():
-            wiki_sentences = []
-            # text = self.__coref_resolution(page.text)
-            for p in page.text.split('\n'):
-                if p != '':
-                    if p[-1] not in self.punct:
-                        p += '.'
-                    wiki_sentences += sent_tokenize(p)
-            refs = [{
-                "sentence": sentence,
-                "embedding": None
-            } for sentence in wiki_sentences]
-        return refs
+        page = wikipedia.page(topic, auto_suggest=False)
+        sentences = []
+        if page:
+            doc = self.nlp(page.content)
+            for sent in doc.sents:
+                if '==' not in sent.text:
+                    sentences.append(sent.text.strip())
+            text = ' '.join(sentences)
+            clean_text = self.__coref_resolution(text)
+            doc = self.nlp(clean_text)
+            clean_sentences = []
+            for sent in doc.sents:
+                clean_sentences.append(sent.text.strip())
+        return clean_sentences
 
     def __get_entailment_score(self, text, hypothesis):
         if hypothesis[-1] in self.punct:
@@ -132,32 +135,26 @@ class Factchecker:
             return ENTAILMENT
         return NEUTRAL
 
-    def __get_relevant_refs(self, refs: list, source: str, threshold: float = 0.7):
-        source_embedding = self.bert.encode(
-            source, convert_to_tensor=True)
-        scores = []
-        for sentence in refs:
-            if sentence['embedding'] is None:
-                sentence['embedding'] = self.bert.encode(
-                    sentence['sentence'], convert_to_tensor=True)
+    def __get_relevant_refs(self, refs: list, source: str, references_count: int = 3, threshold: float = 0.7):
+        if (self.wiki_embeddings is None):
+            self.wiki_embeddings = self.bert.encode(
+                refs, convert_to_tensor=True)
 
-            score = float(util.pytorch_cos_sim(
-                source_embedding, sentence['embedding'])[0][0])
-            scores.append({
-                'ref': sentence['sentence'],
-                'embedding': sentence['embedding'],
-                'score': score
-            })
-            if score > 0.85:
-                return [scores[-1]]
-        candidates = sorted(list(filter(lambda r: r['score'] > threshold, scores)),
-                            key=lambda x: x['score'], reverse=True)[:5]
-        return candidates
+        source_embedding = self.bert.encode(source, convert_to_tensor=True)
+        distances = [(i, util.pytorch_cos_sim(source_embedding, embedding)[0][0])
+                     for i, embedding in enumerate(self.wiki_embeddings)]
+        best_references_scores = filter(lambda reference: reference[1] > threshold,
+                                        sorted(distances, key=lambda e: e[1], reverse=True)[:references_count])
+
+        best_references = [refs[candidate[0]]
+                           for candidate in list(best_references_scores)]
+        return best_references
 
     def start_factchecking(self, output, threshold):
         '''
             Performs factchecking for a given LLM output
         '''
+        self.wiki_embeddings = None
         llm_output_tokenized, topic = self.__tokenize_sentences(output)
         refs = self.__run_wiki_search(topic)
         fact_checking_results = []
@@ -166,49 +163,22 @@ class Factchecker:
             sentence_fc = []
             for segment in sentence['segmented_sentences']:
                 relevant_refs = self.__get_relevant_refs(
-                    refs, segment, threshold)
+                    refs, segment, 3, threshold)
                 relevant_refs_count = len(relevant_refs)
                 if relevant_refs_count > 0:  # Есть референсы?
                     if relevant_refs_count > 1:  # Есть несколько референсов?
                         refs_judgment = [self.__get_judgment(
-                            segment, ref['ref']) for ref in relevant_refs]
-                        if any([s == ENTAILMENT for s in refs_judgment]) and \
-                                all([s != CONTRADICTION for s in refs_judgment]):
-                            sentence_fc.append({
-                                'sentence_id': sentence['sentence_id'],
-                                "segment": segment,
-                                "judgment": ENTAILMENT,
-                                "refs_judgment": refs_judgment,
-                                'relevant_refs': [r['ref'] for r in relevant_refs]
-                            })
-                        elif any([s == CONTRADICTION for s in refs_judgment]):
-                            sentence_fc.append({
-                                'sentence_id': sentence['sentence_id'],
-                                "segment": segment,
-                                "judgment": CONTRADICTION,
-                                "refs_judgment": refs_judgment,
-                                'relevant_refs': [r['ref'] for r in relevant_refs]
+                            segment, ref) for ref in relevant_refs]
 
-                            })
-                        else:
-                            sentence_fc.append({
-                                'sentence_id': sentence['sentence_id'],
-                                "segment": segment,
-                                "judgment": NEUTRAL,
-                                "refs_judgment": refs_judgment,
-                                'relevant_refs': [r['ref'] for r in relevant_refs]
-                            })
-
-                    else:
-                        judgment = self.__get_judgment(
-                            segment, relevant_refs[0]['ref'])
+                        judgment = next((x for x in refs_judgment if x in [
+                                        ENTAILMENT, CONTRADICTION]), NEUTRAL)
                         sentence_fc.append({
                             'sentence_id': sentence['sentence_id'],
                             "segment": segment,
                             "judgment": judgment,
-                            'relevant_refs': [r['ref'] for r in relevant_refs]
+                            "refs_judgment": refs_judgment,
+                            'relevant_refs': relevant_refs
                         })
-
                 # Предложение разбито на несколько?
                 elif len(sentence['segmented_sentences']) > 1:
                     wait_list.append(segment)
