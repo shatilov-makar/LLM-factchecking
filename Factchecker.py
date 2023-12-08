@@ -4,13 +4,14 @@ import nltk
 from nltk.tokenize import sent_tokenize
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# from llamaapi import LlamaAPI
+from llamaapi import LlamaAPI
 from SemanticAnalys import SemanticAnalys
 import wikipedia
 import requests
 import torch
 from torch import nn
 import spacy
+import re
 
 CONTRADICTION = 'CONTRADICTION'
 NEUTRAL = 'NEUTRAL'
@@ -19,14 +20,15 @@ SUSPICIOUS = 'SUSPICIOUS'
 
 
 class Factchecker:
-    def __init__(self) -> None:
-
+    def __init__(self, LLAMA_API_TOKEN) -> None:
+        self.LLAMA_API_TOKEN = LLAMA_API_TOKEN
         self.bert = SentenceTransformer(
             'sentence-transformers/all-mpnet-base-v2')
-        self.tokenizer = AutoTokenizer.from_pretrained("roberta-large-mnli")
 
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.tokenizer = AutoTokenizer.from_pretrained("roberta-large-mnli")
         self.roberta = AutoModelForSequenceClassification.from_pretrained(
-            "roberta-large-mnli")
+            "roberta-large-mnli").to(self.device)
 
         self.semantic_analys = SemanticAnalys()
         self.punct = set(['.', '!', '?', '/n'])
@@ -35,20 +37,20 @@ class Factchecker:
     def __del__(self):
         torch.cuda.empty_cache()
 
-    # def __get_llm_output(self, prompt: str) -> str:
-    #     '''
-    #         Returns LLAMA-2 output for the given prompt.
-    #     '''
-    #     llama = LlamaAPI(self.LLAMA_API_TOKEN)
-    #     api_request_json = {
-    #         "temperature": 0.1,
-    #         "messages": [
-    #             {"role": "user", "content": prompt},
-    #         ],
-    #         "stream": False,
-    #     }
-    #     response = llama.run(api_request_json)
-    #     return json.dumps(response.json()['choices'][0]['message']['content'], indent=2)
+    def __get_llm_output(self, prompt: str) -> str:
+        '''
+            Returns LLAMA-2 output for the given prompt.
+        '''
+        llama = LlamaAPI(self.LLAMA_API_TOKEN)
+        api_request_json = {
+            "temperature": 0.1,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+        }
+        response = llama.run(api_request_json)
+        return json.dumps(response.json()['choices'][0]['message']['content'], indent=2)
 
     def __coref_resolution(self, text: str) -> str:
         '''
@@ -110,30 +112,76 @@ class Factchecker:
                 clean_sentences.append(sent.text.strip())
         return clean_sentences
 
-    def __get_entailment_score(self, text, hypothesis):
-        if hypothesis[-1] in self.punct:
-            sequence_to_classify = ' '.join([hypothesis, text])
-        else:
-            sequence_to_classify = '. '.join([hypothesis, text])
+    def __get_entailment_score(self, hypothesis, refs):
+        refs_and_hypothesis = []
+        for text in refs:
+            if hypothesis[-1] in self.punct:
+                sequence_to_classify = ' '.join([text, hypothesis])
+            else:
+                sequence_to_classify = '. '.join([text, hypothesis])
+            refs_and_hypothesis.append(sequence_to_classify)
 
-        inputs = self.tokenizer(sequence_to_classify,
-                                return_tensors="pt")
+        inputs = self.tokenizer.batch_encode_plus(refs_and_hypothesis,
+                                                  padding=True, truncation=True,
+                                                  return_tensors="pt").to(self.device)
         softmax = nn.Softmax(dim=1)
         with torch.no_grad():
             logits = self.roberta(**inputs).logits
-            res = {}
-            for label, score in zip(self.roberta.config.id2label.values(), softmax(logits).numpy()[0]):
-                res[label] = score
-            return res
+            scores = []
+            for score in softmax(logits):
+                ref_score = {}
+                for label, score in zip(self.roberta.config.id2label.values(), score):
+                    ref_score[label] = score
+                scores.append(ref_score)
+            return scores
 
-    def __get_judgment(self, segment, ref):
-        score = self.__get_entailment_score(segment, ref)
-        judgment = max(score, key=score.get)
-        if judgment in [ENTAILMENT, CONTRADICTION]:
-            return judgment
-        if score[ENTAILMENT] > score[CONTRADICTION] and score[ENTAILMENT] > 0.10:
-            return ENTAILMENT
-        return NEUTRAL
+    # сделать чтобы принимал лист
+    def __get_roberta_judgments(self, segment, refs):
+        scores = self.__get_entailment_score(segment, refs)
+        judgments = []
+        for score in scores:
+
+            judgment = max(score, key=score.get)
+            if judgment in [ENTAILMENT, CONTRADICTION]:
+                judgments.append(judgment)
+            elif score[ENTAILMENT] > score[CONTRADICTION] and score[ENTAILMENT] > 0.10:
+                judgments.append(ENTAILMENT)
+            else:
+                judgments.append(NEUTRAL)
+        return judgments
+
+    def __get_llm_judgments(self, segment, refs):
+        facts = '\n'.join(
+            [f'Fact_{i+1}: {reference}' for i, reference in enumerate(refs)])
+        facts_enum = ' and '.join([f'Fact_{i+1}' for i in range(len(refs))])
+        how_to_print = '\n'.join(
+            [f'Fact_{i+1}: corresponds/contradicts/neutral' for i in range(len(refs))])
+        prompt = f'''
+            Source_1: {segment}
+            {facts}
+            Determine whether the information from Source_1 contradict, correspond or are neutral to the {facts_enum}. 
+            Do not pay attention if the {facts_enum} contain information that is not in the Source_1.
+            Define a fact as "correspond" only if the fact matches the information in Source_1 as closely as possible.
+            If a Fact contains information that is not directly related to the Source_1, define the fact as "neutral".
+            Type:"{how_to_print}"
+            Do not type explanation.
+        '''
+        output = self.__get_llm_output(prompt)
+        labels = [('correspond', ENTAILMENT), ('neutral', NEUTRAL),
+                  ('contradict', CONTRADICTION)]
+        judgments = []
+        for i in range(len(refs)):
+            fact_number = i + 1
+            reg_expr = f'(Fact_{fact_number}.{{1,4}}correspond|Fact_{fact_number}.{{1,4}}neutral|Fact_{fact_number}.{{1,4}}contradict)'
+            reg_substr = re.search(reg_expr, output)
+            if reg_substr:
+                for label in labels:
+                    if label[0] in reg_substr[0]:
+                        judgments.append(label[1])
+            else:
+                judgments.append(NEUTRAL)
+
+        return judgments
 
     def __get_relevant_refs(self, refs: list, source: str, references_count: int = 3, threshold: float = 0.7):
         if (self.wiki_embeddings is None):
@@ -166,19 +214,21 @@ class Factchecker:
                     refs, segment, 3, threshold)
                 relevant_refs_count = len(relevant_refs)
                 if relevant_refs_count > 0:  # Есть референсы?
-                    if relevant_refs_count > 1:  # Есть несколько референсов?
-                        refs_judgment = [self.__get_judgment(
-                            segment, ref) for ref in relevant_refs]
 
-                        judgment = next((x for x in refs_judgment if x in [
-                                        ENTAILMENT, CONTRADICTION]), NEUTRAL)
-                        sentence_fc.append({
-                            'sentence_id': sentence['sentence_id'],
-                            "segment": segment,
-                            "judgment": judgment,
-                            "refs_judgment": refs_judgment,
-                            'relevant_refs': relevant_refs
-                        })
+                    roberta_judgments = self.__get_roberta_judgments(
+                        segment, relevant_refs)
+                    llm_judgments = self.__get_llm_judgments(
+                        segment, relevant_refs)
+                    judgment = next((x for x, y in zip(llm_judgments, roberta_judgments) if (
+                        x in [ENTAILMENT, CONTRADICTION]) and x == y), NEUTRAL)
+
+                    sentence_fc.append({
+                        'sentence_id': sentence['sentence_id'],
+                        "segment": segment,
+                        "judgment": judgment,
+                        "refs_judgment": [roberta_judgments, llm_judgments],
+                        'relevant_refs': relevant_refs
+                    })
                 # Предложение разбито на несколько?
                 elif len(sentence['segmented_sentences']) > 1:
                     wait_list.append(segment)
@@ -205,4 +255,5 @@ class Factchecker:
                         "judgment": SUSPICIOUS
                     })
             fact_checking_results += sentence_fc.copy()
+        torch.cuda.empty_cache()
         return fact_checking_results
