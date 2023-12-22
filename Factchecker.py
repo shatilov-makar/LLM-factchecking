@@ -1,6 +1,5 @@
 #!python3_10/bin/python
 import json
-import nltk
 from nltk.tokenize import sent_tokenize
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -95,8 +94,10 @@ class Factchecker:
         sa = self.semantic_analys.semantic_analys(sentences)
         return sa
 
-    def __run_wiki_search(self, topic) -> list:
-        print(topic)
+    def __run_wiki_search(self, topic: str) -> list:
+        '''
+            Returns a Wikipedia article by given title
+        '''
         page = wikipedia.page(topic, auto_suggest=False)
         sentences = []
         if page:
@@ -112,7 +113,12 @@ class Factchecker:
                 clean_sentences.append(sent.text.strip())
         return clean_sentences
 
-    def __get_entailment_score(self, hypothesis, refs):
+    def __get_entailment_score(self, hypothesis: str, refs: str) -> list:
+        ''' 
+            Given a premise sentence and a hypothesis sentence, returns a 
+            state depending on whether the premise entails the hypothesis (ENTAILMENT), 
+            contradicts the hypothesis (CONTRADICTION), or neither (NEUTRAL).
+        '''
         refs_and_hypothesis = []
         for text in refs:
             if hypothesis[-1] in self.punct:
@@ -135,8 +141,11 @@ class Factchecker:
                 scores.append(ref_score)
             return scores
 
-    # сделать чтобы принимал лист
-    def __get_roberta_judgments(self, segment, refs):
+    def __get_roberta_judgments(self, segment: str, refs: list) -> list:
+        '''
+        Returns a textual entailment score for the given segment with each reference 
+        from given list of references
+        '''
         scores = self.__get_entailment_score(segment, refs)
         judgments = []
         for score in scores:
@@ -150,7 +159,26 @@ class Factchecker:
                 judgments.append(NEUTRAL)
         return judgments
 
-    def __get_llm_judgments(self, segment, refs):
+    def __fix_segment(self, segment: str, fact: str) -> str:
+        '''
+        Fix segment based on fact using LLM
+        '''
+
+        prompt = f'Source = {segment} \
+                    Fact = {fact} \
+                    New_Source = Source modified to reflect Fact.\
+                    Do not type explanation, comments and score.\
+                    Start type with: "New_Source: ...'
+        llm_output = self.__get_llm_output(prompt)
+        llm_output = llm_output.strip('\n. "').split('New_Source:')[-1].strip()
+        if '"' in llm_output:
+            llm_output = llm_output.split('"')[1]
+        return llm_output
+
+    def __get_llm_judgments(self, segment: str, refs: list) -> list:
+        '''
+        Returns truthfulness of segment based on list of references 
+        '''
         facts = '\n'.join(
             [f'Fact_{i+1}: {reference}' for i, reference in enumerate(refs)])
         facts_enum = ' and '.join([f'Fact_{i+1}' for i in range(len(refs))])
@@ -184,6 +212,9 @@ class Factchecker:
         return judgments
 
     def __get_relevant_refs(self, refs: list, source: str, references_count: int = 3, threshold: float = 0.7):
+        '''
+            Filter sentences from Wikipedia articles, saves only relevant sentences.
+        '''
         if (self.wiki_embeddings is None):
             self.wiki_embeddings = self.bert.encode(
                 refs, convert_to_tensor=True)
@@ -198,7 +229,7 @@ class Factchecker:
                            for candidate in list(best_references_scores)]
         return best_references
 
-    def start_factchecking(self, output, threshold):
+    def start_factchecking(self, output, references_count, threshold):
         '''
             Performs factchecking for a given LLM output
         '''
@@ -206,12 +237,13 @@ class Factchecker:
         llm_output_tokenized, topic = self.__tokenize_sentences(output)
         refs = self.__run_wiki_search(topic)
         fact_checking_results = []
+        reliable_sentences = []
         for sentence in llm_output_tokenized:
             wait_list = []
             sentence_fc = []
             for segment in sentence['segmented_sentences']:
                 relevant_refs = self.__get_relevant_refs(
-                    refs, segment, 3, threshold)
+                    refs, segment, references_count, threshold)
                 relevant_refs_count = len(relevant_refs)
                 if relevant_refs_count > 0:  # Есть референсы?
 
@@ -219,9 +251,14 @@ class Factchecker:
                         segment, relevant_refs)
                     llm_judgments = self.__get_llm_judgments(
                         segment, relevant_refs)
-                    judgment = next((x for x, y in zip(llm_judgments, roberta_judgments) if (
-                        x in [ENTAILMENT, CONTRADICTION]) and x == y), NEUTRAL)
-
+                    fact_index, judgment = next(((i, x) for i, (x, y) in enumerate(zip(llm_judgments, roberta_judgments)) if (
+                        x in [ENTAILMENT, CONTRADICTION]) and x == y), (NEUTRAL, -1))
+                    if judgment == ENTAILMENT:
+                        reliable_sentences.append(segment)
+                    elif judgment == CONTRADICTION:
+                        fixed_sentence = self.__fix_segment(
+                            segment, relevant_refs[fact_index])
+                        reliable_sentences.append(fixed_sentence)
                     sentence_fc.append({
                         'sentence_id': sentence['sentence_id'],
                         "segment": segment,
@@ -256,4 +293,13 @@ class Factchecker:
                     })
             fact_checking_results += sentence_fc.copy()
         torch.cuda.empty_cache()
-        return fact_checking_results
+        if len(reliable_sentences) > 0:
+            reliable_sentences = ",".join(
+                ['"' + sentence + '"' for sentence in reliable_sentences])
+            prompt = f'Write a text using following sentences: {reliable_sentences}\n\
+                        Do not use any additional information.  \
+                        Do not type explanation and comments. \
+                        Start with "Text: ..."'
+            llm_output = self.__get_llm_output(prompt)
+            return fact_checking_results, llm_output
+        return llm_output

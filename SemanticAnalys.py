@@ -1,15 +1,10 @@
 #!python3_10/Scripts/python
-import spacy
-from spacy import displacy
 from allennlp.predictors.predictor import Predictor
-import allennlp_models.tagging
 import nltk
-import numpy as np
 
 
 class SemanticAnalys:
     def __init__(self):
-       # NER = spacy.load("en_core_web_sm")
         nltk.download('punkt')
         SRL_MODEL_PATH = "https://storage.googleapis.com/allennlp-public-models/structured-prediction-srl-bert.2020.12.15.tar.gz"
         self.predictor = Predictor.from_path(SRL_MODEL_PATH)
